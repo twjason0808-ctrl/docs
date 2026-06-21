@@ -11,6 +11,7 @@
 # 2) 支援 compact / full DJI FlightRecord 欄位。
 # 3) 缺起降電量時，不硬算老化電池。
 # 4) 可一次丟多個 xlsx，會用 Flight time + Serial Number 去重。
+# 5) 段落輸出新增 status/recommendation，避免空白 flags 在手機上看成 NaN。
 
 import sys
 from pathlib import Path
@@ -113,10 +114,22 @@ def enrich(df):
             out.append('滿電起飛')
         if pd.notna(r['start_batt']) and r['start_batt'] < 30:
             out.append('低電起飛<30')
-        return '、'.join(out)
+        return '、'.join(out) if out else 'OK'
 
     df['flags'] = df.apply(flags, axis=1)
     return df.sort_values('start_dt').reset_index(drop=True)
+
+
+def segment_decision(start_batt, end_batt, drain):
+    if pd.isna(start_batt) or pd.isna(end_batt):
+        return '不能判斷', '補起降電量資料'
+    if end_batt <= 20:
+        return '過低', '下次提早收，35%不進新田'
+    if end_batt < 30:
+        return '接近底線', '可用，但30%前要結束'
+    if pd.notna(drain) and drain > 9:
+        return '耗電偏高', '查風、載重、噴量、馬達阻力'
+    return '可用', '正常作業'
 
 
 def infer_segments(df, jump_threshold=5):
@@ -164,6 +177,7 @@ def infer_segments(df, jump_threshold=5):
             flags.append('整段高耗電')
         if g['start_batt'].isna().any() or g['end_batt'].isna().any():
             flags.append('缺電量')
+        status, recommendation = segment_decision(start_batt, end_batt, drain)
         summary.append({
             'segment': cid,
             'date': str(g.iloc[0]['date']),
@@ -180,7 +194,9 @@ def infer_segments(df, jump_threshold=5):
             'drop_pct': drop,
             'drain_pct_min': drain,
             'empty_flights': int((g['area_m2'] == 0).sum()),
-            'flags': '、'.join(flags),
+            'status': status,
+            'recommendation': recommendation,
+            'flags': '、'.join(flags) if flags else 'OK',
         })
     return pd.DataFrame(summary)
 
@@ -192,7 +208,10 @@ def print_summary(df, segments):
     print(f"總趟次: {len(df)} | 有效噴灑: {len(spray)} | 空飛/測試: {(df['area_m2']==0).sum()}")
     print(f"總面積: {df['area_m2'].sum():.0f} m² = {df['area_fen'].sum():.2f} 分 = {df['area_m2'].sum()/JIA_M2:.2f} 甲")
     print(f"總用藥: {df['amount_l'].sum():.2f} L | 平均 {df['amount_l'].sum()/df['area_fen'].sum():.2f} L/分")
-    print(f"總飛行: {df['dur_min'].sum():.1f} min | 有效效率: {df['area_m2'].sum()/spray['dur_min'].sum():.0f} m²/min")
+    if len(spray):
+        print(f"總飛行: {df['dur_min'].sum():.1f} min | 有效效率: {df['area_m2'].sum()/spray['dur_min'].sum():.0f} m²/min")
+    else:
+        print(f"總飛行: {df['dur_min'].sum():.1f} min | 有效效率: 無有效噴灑")
     if len(batt):
         print(f"平均耗電: {batt['drop_pct'].sum()/batt['dur_min'].sum():.2f}%/min")
     print(f"低電降落(<=20%): {(df['end_batt']<=20).sum()} 趟")
@@ -205,15 +224,28 @@ def print_summary(df, segments):
         print('\n注意: Battery SN 欄位沒有資料。不要把 Serial Number 當電池編號。')
         print('以下只輸出「推定電池段」，不是實體電池健康排名。')
 
+    print('\n=== 明日決策 ===')
+    low_segments = segments[pd.to_numeric(segments['end_batt'], errors='coerce') <= 20]
+    edge_segments = segments[(pd.to_numeric(segments['end_batt'], errors='coerce') > 20) & (pd.to_numeric(segments['end_batt'], errors='coerce') < 30)]
+    missing_segments = segments[segments['status'] == '不能判斷']
+    print(f"低電收尾段: {len(low_segments)} 段 | 接近底線段: {len(edge_segments)} 段 | 缺電量段: {len(missing_segments)} 段")
+    if len(low_segments):
+        print('規則: 35% 不進新田，30% 前結束，低於 25% 不硬飛。')
+    else:
+        print('規則: 維持 35% 不進新田，避免把電池拉到 20% 以下。')
+
     print('\n=== 推定電池段 ===')
     show = segments.copy()
     for c in ['area_m2', 'area_fen', 'amount_l', 'dur_min', 'drain_pct_min']:
         if c in show.columns:
             show[c] = pd.to_numeric(show[c], errors='coerce').round(2)
-    print(show.to_string(index=False))
+    # 手機窄螢幕優先看這幾欄
+    cols = ['segment','start_time','end_time','location','flights','area_fen','amount_l','dur_min','start_batt','end_batt','drain_pct_min','status','flags','recommendation']
+    cols = [c for c in cols if c in show.columns]
+    print(show[cols].to_string(index=False))
 
     print('\n=== 需要回看逐趟 ===')
-    flagged = df[df['flags'].astype(str).str.len() > 0]
+    flagged = df[df['flags'] != 'OK']
     cols = ['Flight time','location_short','area_m2','dur_min','start_batt','end_batt','drain_pct_min','eff_m2_min','flags']
     tmp = flagged[cols].copy()
     for c in ['area_m2','dur_min','drain_pct_min','eff_m2_min']:
